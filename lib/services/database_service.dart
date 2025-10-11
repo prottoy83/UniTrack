@@ -11,6 +11,11 @@ class DatabaseService {
   Future<void> initializeDatabase() async {
     try {
       final db = await getDatabase();
+      
+      // Debug: Check current database version
+      final version = await db.getVersion();
+      print('DEBUG: Current database version: $version');
+      
       await _ensureTablesExist(db);
       print('Database initialized successfully');
     } catch (e) {
@@ -25,11 +30,13 @@ class DatabaseService {
 
     final database = await openDatabase(
       databasePath,
-      version: 3, // Increased version for semester dates
+      version: 5, // Updated version for separate time fields and attendance tracking
       onCreate: (db, version) async {
+        print('DEBUG: onCreate called with version $version');
         await _createTables(db);
       },
       onUpgrade: (db, oldVersion, newVersion) async {
+        print('DEBUG: onUpgrade called from version $oldVersion to $newVersion');
         print('Upgrading database from version $oldVersion to $newVersion');
         if (oldVersion < 2) {
           // Add new tables for version 2
@@ -39,8 +46,18 @@ class DatabaseService {
           // Add semester dates for version 3
           await _addSemesterDates(db);
         }
+        if (oldVersion < 4) {
+          // Update schedule table schema for version 4
+          await _updateScheduleTableSchema(db);
+        }
+        if (oldVersion < 5) {
+          // Add separate start/end times and attendance tracking for version 5
+          print('DEBUG: Calling _addTimeFieldsAndAttendanceTracking');
+          await _addTimeFieldsAndAttendanceTracking(db);
+        }
       },
       onOpen: (db) async {
+        print('DEBUG: onOpen called');
         // Ensure tables exist even if onCreate wasn't called
         await _ensureTablesExist(db);
       },
@@ -95,11 +112,23 @@ class DatabaseService {
       CREATE TABLE IF NOT EXISTS schedule (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         courseId INTEGER NOT NULL,
-        dayOfWeek INTEGER NOT NULL,
+        dayOfWeek TEXT NOT NULL,
         startTime TEXT NOT NULL,
         endTime TEXT NOT NULL,
         room TEXT,
         FOREIGN KEY (courseId) REFERENCES course (id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS class_attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scheduleId INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('attended', 'skipped', 'cancelled')),
+        createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (scheduleId) REFERENCES schedule (id) ON DELETE CASCADE,
+        UNIQUE(scheduleId, date)
       )
     ''');
 
@@ -142,11 +171,23 @@ class DatabaseService {
       CREATE TABLE IF NOT EXISTS schedule (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         courseId INTEGER NOT NULL,
-        dayOfWeek INTEGER NOT NULL,
+        dayOfWeek TEXT NOT NULL,
         startTime TEXT NOT NULL,
         endTime TEXT NOT NULL,
         room TEXT,
         FOREIGN KEY (courseId) REFERENCES course (id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS class_attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scheduleId INTEGER NOT NULL,
+        date TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('attended', 'skipped', 'cancelled')),
+        createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (scheduleId) REFERENCES schedule (id) ON DELETE CASCADE,
+        UNIQUE(scheduleId, date)
       )
     ''');
 
@@ -175,6 +216,130 @@ class DatabaseService {
       // Columns might already exist, ignore error
       print('Semester date columns might already exist: $e');
     }
+  }
+
+  Future<void> _updateScheduleTableSchema(Database db) async {
+    try {
+      // First, rename the old table
+      await db.execute('ALTER TABLE schedule RENAME TO schedule_old');
+      
+      // Create new schedule table with updated schema
+      await db.execute('''
+        CREATE TABLE schedule (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          courseId INTEGER NOT NULL,
+          dayOfWeek TEXT NOT NULL,
+          time TEXT NOT NULL,
+          room TEXT,
+          FOREIGN KEY (courseId) REFERENCES course (id) ON DELETE CASCADE
+        )
+      ''');
+      
+      // Migrate data from old table to new table
+      final oldSchedules = await db.query('schedule_old');
+      for (final schedule in oldSchedules) {
+        final dayOfWeekInt = schedule['dayOfWeek'] as int;
+        final dayOfWeekString = _convertDayOfWeekToString(dayOfWeekInt);
+        final startTime = schedule['startTime'] as String;
+        
+        await db.insert('schedule', {
+          'id': schedule['id'],
+          'courseId': schedule['courseId'],
+          'dayOfWeek': dayOfWeekString,
+          'time': startTime, // Use startTime as the notification time
+          'room': schedule['room'],
+        });
+      }
+      
+      // Drop the old table
+      await db.execute('DROP TABLE schedule_old');
+      print('Updated schedule table schema successfully');
+    } catch (e) {
+      print('Error updating schedule table schema: $e');
+    }
+  }
+
+  Future<void> _addTimeFieldsAndAttendanceTracking(Database db) async {
+    try {
+      print('DEBUG: Migration method called - _addTimeFieldsAndAttendanceTracking');
+      print('Starting migration to add separate time fields and attendance tracking...');
+      
+      // Step 1: Backup existing schedule data
+      final existingSchedules = await db.query('schedule');
+      print('Found ${existingSchedules.length} existing schedules to migrate');
+      
+      // Step 2: Drop and recreate schedule table with new schema
+      await db.execute('DROP TABLE IF EXISTS schedule');
+      await db.execute('''
+        CREATE TABLE schedule (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          courseId INTEGER NOT NULL,
+          dayOfWeek TEXT NOT NULL,
+          startTime TEXT NOT NULL,
+          endTime TEXT NOT NULL,
+          room TEXT,
+          FOREIGN KEY (courseId) REFERENCES course (id) ON DELETE CASCADE
+        )
+      ''');
+      
+      // Step 3: Migrate data - convert single time to startTime, add default endTime
+      for (final schedule in existingSchedules) {
+        final timeValue = schedule['time'] as String;
+        // Assume the time is start time and add 1 hour for end time
+        final startTime = timeValue;
+        String endTime;
+        
+        // Try to parse time and add 1 hour
+        try {
+          final parts = timeValue.split(':');
+          if (parts.length >= 2) {
+            int hour = int.parse(parts[0]);
+            int minute = int.parse(parts[1]);
+            hour = (hour + 1) % 24; // Add 1 hour, wrap around at 24
+            endTime = '${hour.toString().padLeft(2, '0')}:${minute.toString().padLeft(2, '0')}';
+          } else {
+            endTime = timeValue; // Fallback to same time
+          }
+        } catch (e) {
+          endTime = timeValue; // Fallback to same time if parsing fails
+        }
+        
+        await db.insert('schedule', {
+          'id': schedule['id'],
+          'courseId': schedule['courseId'],
+          'dayOfWeek': schedule['dayOfWeek'],
+          'startTime': startTime,
+          'endTime': endTime,
+          'room': schedule['room'],
+        });
+      }
+      
+      // Step 4: Create attendance tracking table
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS class_attendance (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scheduleId INTEGER NOT NULL,
+          date TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('attended', 'skipped', 'cancelled')),
+          createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (scheduleId) REFERENCES schedule (id) ON DELETE CASCADE,
+          UNIQUE(scheduleId, date)
+        )
+      ''');
+      
+      print('Successfully migrated schedule table and added attendance tracking');
+    } catch (e) {
+      print('Error during migration: $e');
+      rethrow;
+    }
+  }
+
+  String _convertDayOfWeekToString(int dayOfWeek) {
+    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+    if (dayOfWeek >= 1 && dayOfWeek <= 7) {
+      return days[dayOfWeek - 1];
+    }
+    return 'Monday'; // Default fallback
   }
 
   Future<void> _ensureTablesExist(Database db) async {
@@ -585,7 +750,7 @@ class DatabaseService {
 
   Future<bool> addSchedule({
     required int courseId,
-    required int dayOfWeek,
+    required dynamic dayOfWeek,
     required String startTime,
     required String endTime,
     String? room,
@@ -593,11 +758,20 @@ class DatabaseService {
     try {
       final database = await getDatabase();
       
+      // Convert dayOfWeek to string format for database
+      String dayOfWeekString;
+      if (dayOfWeek is int) {
+        const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+        dayOfWeekString = days[dayOfWeek % 7];
+      } else {
+        dayOfWeekString = dayOfWeek.toString();
+      }
+
       final result = await database.insert(
         'schedule',
         {
           'courseId': courseId,
-          'dayOfWeek': dayOfWeek,
+          'dayOfWeek': dayOfWeekString,
           'startTime': startTime,
           'endTime': endTime,
           'room': room,
@@ -773,6 +947,197 @@ class DatabaseService {
     } catch (e) {
       print('Error getting all semesters: $e');
       return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getAllCourses() async {
+    try {
+      final database = await getDatabase();
+      
+      final result = await database.query(
+        'course',
+        orderBy: 'courseName ASC',
+      );
+      
+      return result;
+    } catch (e) {
+      print('Error getting all courses: $e');
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> getScheduleForCourse(int courseId) async {
+    try {
+      final database = await getDatabase();
+      
+      final result = await database.query(
+        'schedule',
+        where: 'courseId = ?',
+        whereArgs: [courseId],
+      );
+      
+      return result;
+    } catch (e) {
+      print('Error getting schedule for course: $e');
+      return [];
+    }
+  }
+
+  Future<bool> addAttendanceRecord(int courseId, DateTime date, {required bool isPresent}) async {
+    try {
+      final database = await getDatabase();
+      
+      // Get current attendance data
+      final attendanceResult = await database.query(
+        'attendance',
+        where: 'courseId = ?',
+        whereArgs: [courseId],
+      );
+
+      int daysAttended = 0;
+      int totalDays = 1; // This new record
+
+      if (attendanceResult.isNotEmpty) {
+        final existing = attendanceResult.first;
+        daysAttended = existing['daysAttended'] as int;
+        totalDays = (existing['totalDays'] as int) + 1;
+      }
+
+      if (isPresent) {
+        daysAttended += 1;
+      }
+
+      // Update attendance record
+      if (attendanceResult.isNotEmpty) {
+        await database.update(
+          'attendance',
+          {
+            'daysAttended': daysAttended,
+            'totalDays': totalDays,
+            'updatedAt': date.toIso8601String(),
+          },
+          where: 'courseId = ?',
+          whereArgs: [courseId],
+        );
+      } else {
+        await database.insert(
+          'attendance',
+          {
+            'courseId': courseId,
+            'daysAttended': daysAttended,
+            'totalDays': totalDays,
+            'updatedAt': date.toIso8601String(),
+          },
+        );
+      }
+
+      return true;
+    } catch (e) {
+      print('Error adding attendance record: $e');
+      return false;
+    }
+  }
+
+  // Class attendance tracking methods
+  Future<bool> markClassAttendance({
+    required int scheduleId,
+    required String date,
+    required String status, // 'attended', 'skipped', 'cancelled'
+  }) async {
+    try {
+      final database = await getDatabase();
+      
+      await database.rawQuery('''
+        INSERT OR REPLACE INTO class_attendance 
+        (scheduleId, date, status, createdAt) 
+        VALUES (?, ?, ?, ?)
+      ''', [scheduleId, date, status, DateTime.now().toIso8601String()]);
+      
+      return true;
+    } catch (e) {
+      print('Error marking class attendance: $e');
+      return false;
+    }
+  }
+
+  Future<String?> getClassAttendanceStatus({
+    required int scheduleId,
+    required String date,
+  }) async {
+    try {
+      final database = await getDatabase();
+      
+      final result = await database.query(
+        'class_attendance',
+        where: 'scheduleId = ? AND date = ?',
+        whereArgs: [scheduleId, date],
+        limit: 1,
+      );
+      
+      return result.isNotEmpty ? result.first['status'] as String : null;
+    } catch (e) {
+      print('Error getting class attendance status: $e');
+      return null;
+    }
+  }
+
+  Future<Map<String, int>> getAttendanceStats(int courseId) async {
+    try {
+      final database = await getDatabase();
+      
+      // Get all schedules for this course
+      final schedules = await database.query(
+        'schedule',
+        where: 'courseId = ?',
+        whereArgs: [courseId],
+      );
+      
+      if (schedules.isEmpty) {
+        return {'attended': 0, 'skipped': 0, 'cancelled': 0, 'total': 0};
+      }
+      
+      final scheduleIds = schedules.map((s) => s['id']).toList();
+      final placeholders = scheduleIds.map((_) => '?').join(',');
+      
+      // Get attendance stats
+      final result = await database.rawQuery('''
+        SELECT status, COUNT(*) as count
+        FROM class_attendance 
+        WHERE scheduleId IN ($placeholders)
+        GROUP BY status
+      ''', scheduleIds);
+      
+      int attended = 0, skipped = 0, cancelled = 0;
+      
+      for (final row in result) {
+        final status = row['status'] as String;
+        final count = row['count'] as int;
+        
+        switch (status) {
+          case 'attended':
+            attended = count;
+            break;
+          case 'skipped':
+            skipped = count;
+            break;
+          case 'cancelled':
+            cancelled = count;
+            break;
+        }
+      }
+      
+      // Total classes = attended + skipped (cancelled doesn't count towards total)
+      final total = attended + skipped;
+      
+      return {
+        'attended': attended,
+        'skipped': skipped,
+        'cancelled': cancelled,
+        'total': total,
+      };
+    } catch (e) {
+      print('Error getting attendance stats: $e');
+      return {'attended': 0, 'skipped': 0, 'cancelled': 0, 'total': 0};
     }
   }
 }

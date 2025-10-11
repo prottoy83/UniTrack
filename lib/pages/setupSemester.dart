@@ -11,7 +11,9 @@ class Course {
 }
 
 class SetupSemesterPage extends StatefulWidget {
-  const SetupSemesterPage({super.key});
+  final Map<String, dynamic>? existingSemester;
+  
+  const SetupSemesterPage({super.key, this.existingSemester});
 
   @override
   State<SetupSemesterPage> createState() => _SetupSemesterPageState();
@@ -25,11 +27,59 @@ class _SetupSemesterPageState extends State<SetupSemesterPage> {
   final List<Course> _courses = [];
   final List<TextEditingController> _courseNameControllers = [];
   final List<TextEditingController> _courseCreditControllers = [];
+  bool _isLoading = false;
 
   @override
   void initState() {
     super.initState();
-    _initializeCourses();
+    if (widget.existingSemester != null) {
+      _isLoading = true;
+      _initializeCourses(); // Initialize with default first
+      _loadExistingSemesterData();
+    } else {
+      _initializeCourses();
+    }
+  }
+
+  Future<void> _loadExistingSemesterData() async {
+    try {
+      final semester = widget.existingSemester!;
+      
+      // Set semester number
+      _semesterController.text = semester['semesterNumber'].toString();
+      
+      // Get courses for this semester directly from database
+      final database = await DatabaseService.instance.getDatabase();
+      final coursesResult = await database.query(
+        'course',
+        where: 'semesterId = ?',
+        whereArgs: [semester['id']],
+      );
+      
+      setState(() {
+        _numberOfCourses = coursesResult.length > 0 ? coursesResult.length : 1;
+        _initializeCourses(); // Reinitialize with correct count
+        
+        // Populate course data
+        for (int i = 0; i < coursesResult.length && i < _courseNameControllers.length; i++) {
+          final courseName = coursesResult[i]['courseName'] as String?;
+          final courseCredit = coursesResult[i]['credits'] as double?;
+          
+          _courseNameControllers[i].text = courseName ?? '';
+          _courseCreditControllers[i].text = courseCredit?.toString() ?? '';
+          _courses[i].name = courseName ?? '';
+          _courses[i].credit = courseCredit ?? 0.0;
+        }
+        
+        _isLoading = false;
+      });
+    } catch (e) {
+      print('Error loading existing semester data: $e');
+      setState(() {
+        _isLoading = false;
+        _initializeCourses();
+      });
+    }
   }
 
   void _initializeCourses() {
@@ -194,12 +244,19 @@ class _SetupSemesterPageState extends State<SetupSemesterPage> {
         return;
       }
       
-      // Save to database
       final semesterNumber = int.tryParse(_semesterController.text) ?? 1;
-      final success = await DatabaseService.instance.insertSemester(
-        semesterNumber: semesterNumber,
-        courses: courseData,
-      );
+      bool success = false;
+      
+      if (widget.existingSemester != null) {
+        // Update existing semester
+        success = await _updateExistingSemester(widget.existingSemester!, semesterNumber, courseData);
+      } else {
+        // Create new semester
+        success = await DatabaseService.instance.insertSemester(
+          semesterNumber: semesterNumber,
+          courses: courseData,
+        );
+      }
       
       if (!mounted) return;
       
@@ -207,20 +264,30 @@ class _SetupSemesterPageState extends State<SetupSemesterPage> {
         // Show success message
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Semester $semesterNumber saved successfully!'),
+            content: Text(widget.existingSemester != null 
+              ? 'Semester $semesterNumber updated successfully!'
+              : 'Semester $semesterNumber saved successfully!'),
             backgroundColor: Theme.of(context).colorScheme.primary,
           ),
         );
         
-        // Navigate to dashboard
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(builder: (context) => const DashboardPage()),
-        );
+        // Navigate to dashboard after successful setup
+        if (widget.existingSemester != null) {
+          // If editing existing semester, go back to previous page
+          Navigator.of(context).pop(true);
+        } else {
+          // If this is initial setup, navigate to dashboard
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (context) => const DashboardPage()),
+          );
+        }
       } else {
         // Show error message
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: const Text('Failed to save semester data'),
+            content: Text(widget.existingSemester != null 
+              ? 'Failed to update semester data'
+              : 'Failed to save semester data'),
             backgroundColor: Theme.of(context).colorScheme.error,
           ),
         );
@@ -234,6 +301,46 @@ class _SetupSemesterPageState extends State<SetupSemesterPage> {
           backgroundColor: Theme.of(context).colorScheme.error,
         ),
       );
+    }
+  }
+
+  Future<bool> _updateExistingSemester(
+    Map<String, dynamic> semester, 
+    int semesterNumber, 
+    List<Map<String, dynamic>> courseData
+  ) async {
+    try {
+      final database = await DatabaseService.instance.getDatabase();
+      final semesterId = semester['id'] as int;
+      
+      // Update semester number
+      await database.update(
+        'semester',
+        {'semesterNumber': semesterNumber},
+        where: 'id = ?',
+        whereArgs: [semesterId],
+      );
+      
+      // Delete existing courses for this semester
+      await database.delete(
+        'course',
+        where: 'semesterId = ?',
+        whereArgs: [semesterId],
+      );
+      
+      // Insert updated courses
+      for (final course in courseData) {
+        await database.insert('course', {
+          'semesterId': semesterId,
+          'courseName': course['name'],
+          'credits': course['credits'],
+        });
+      }
+      
+      return true;
+    } catch (e) {
+      print('Error updating semester: $e');
+      return false;
     }
   }
 
@@ -253,17 +360,21 @@ class _SetupSemesterPageState extends State<SetupSemesterPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Setup Semester'),
+        title: Text(widget.existingSemester != null ? 'Edit Semester' : 'Setup Semester'),
         backgroundColor: Theme.of(context).colorScheme.primary,
         foregroundColor: Theme.of(context).colorScheme.onPrimary,
       ),
-      body: Form(
-        key: _formKey,
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
+      body: _isLoading 
+        ? const Center(
+            child: CircularProgressIndicator(),
+          )
+        : Form(
+            key: _formKey,
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
               // Semester Number Input
               Text(
                 'Semester Information',
@@ -348,6 +459,11 @@ class _SetupSemesterPageState extends State<SetupSemesterPage> {
               const SizedBox(height: 12),
               
               ...List.generate(_numberOfCourses, (index) {
+                // Safety check to ensure controllers exist
+                if (index >= _courseNameControllers.length || index >= _courseCreditControllers.length) {
+                  return const SizedBox.shrink();
+                }
+                
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 16),
                   child: Card(

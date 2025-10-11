@@ -13,14 +13,37 @@ class DashboardPage extends StatefulWidget {
   State<DashboardPage> createState() => _DashboardPageState();
 }
 
-class _DashboardPageState extends State<DashboardPage> {
+class _DashboardPageState extends State<DashboardPage> with WidgetsBindingObserver {
   Map<String, dynamic>? _semesterData;
   bool _isLoading = true;
+  List<Map<String, dynamic>> _todaysClasses = [];
 
   @override
   void initState() {
     super.initState();
-    _checkSemesterData();
+    WidgetsBinding.instance.addObserver(this);
+    _refreshDashboardData();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // Refresh data when app comes back to foreground
+    if (state == AppLifecycleState.resumed) {
+      _refreshDashboardData();
+    }
+  }
+
+  // Unified method to refresh all dashboard data
+  Future<void> _refreshDashboardData() async {
+    await _checkSemesterData();
+    await _loadTodaysClasses();
   }
 
   Future<void> _checkSemesterData() async {
@@ -156,11 +179,14 @@ class _DashboardPageState extends State<DashboardPage> {
           ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
+      body: RefreshIndicator(
+        onRefresh: _refreshDashboardData,
+        child: SingleChildScrollView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
             // Semester Header Card
             Card(
               child: Padding(
@@ -171,13 +197,29 @@ class _DashboardPageState extends State<DashboardPage> {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        Text(
-                          'Semester ${semester['semesterNumber']}',
-                          style: TextStyle(
-                            fontSize: 24,
-                            fontWeight: FontWeight.bold,
-                            color: Theme.of(context).colorScheme.primary,
-                          ),
+                        Row(
+                          children: [
+                            Text(
+                              'Semester ${semester['semesterNumber']}',
+                              style: TextStyle(
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                                color: Theme.of(context).colorScheme.primary,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            IconButton(
+                              onPressed: () => _editSemester(semester),
+                              icon: Icon(
+                                Icons.edit,
+                                color: Theme.of(context).colorScheme.primary,
+                                size: 20,
+                              ),
+                              tooltip: 'Edit Semester',
+                              constraints: const BoxConstraints(),
+                              padding: const EdgeInsets.all(4),
+                            ),
+                          ],
                         ),
                         Container(
                           padding: const EdgeInsets.symmetric(
@@ -210,6 +252,11 @@ class _DashboardPageState extends State<DashboardPage> {
                 ),
               ),
             ),
+            
+            const SizedBox(height: 16),
+            
+            // Today's Classes Panel
+            _buildTodaysClassesPanel(),
             
             const SizedBox(height: 16),
             
@@ -371,8 +418,8 @@ class _DashboardPageState extends State<DashboardPage> {
                 return Card(
                   margin: const EdgeInsets.only(bottom: 8),
                   child: ListTile(
-                    onTap: () {
-                      Navigator.push(
+                    onTap: () async {
+                      await Navigator.push(
                         context,
                         MaterialPageRoute(
                           builder: (context) => CoursePage(
@@ -381,6 +428,8 @@ class _DashboardPageState extends State<DashboardPage> {
                           ),
                         ),
                       );
+                      // Refresh dashboard data when returning from course page
+                      _refreshDashboardData();
                     },
                     leading: CircleAvatar(
                       backgroundColor: Theme.of(context).colorScheme.primaryContainer,
@@ -422,8 +471,9 @@ class _DashboardPageState extends State<DashboardPage> {
             const SizedBox(height: 32),
           ],
         ),
-      ),
-    );
+      ), // End of SingleChildScrollView
+    ), // End of RefreshIndicator body
+    ); // End of Scaffold
   }
 
   void _showSemesterDatesModal(BuildContext context, Map<String, dynamic> semester) {
@@ -597,13 +647,404 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  void _showFullScreenMenu(BuildContext context) {
-    Navigator.of(context).push(
+  Future<void> _loadTodaysClasses() async {
+    try {
+      final today = DateTime.now();
+      final todayName = _getDayName(today.weekday);
+      
+      print('DEBUG: Loading today\'s classes for $todayName');
+
+      // Get all schedules for today
+      final database = await DatabaseService.instance.getDatabase();
+      
+      // Debug: Check what columns actually exist in the schedule table
+      final scheduleSchema = await database.rawQuery('PRAGMA table_info(schedule)');
+      print('DEBUG: Schedule table schema: $scheduleSchema');
+      
+      // Debug: Check what columns actually exist in the course table  
+      final courseSchema = await database.rawQuery('PRAGMA table_info(course)');
+      print('DEBUG: Course table schema: $courseSchema');
+      
+      final schedules = await database.rawQuery('''
+        SELECT s.*, c.courseName as courseName 
+        FROM schedule s
+        JOIN course c ON s.courseId = c.id
+        WHERE s.dayOfWeek = ?
+        ORDER BY s.startTime
+      ''', [todayName]);
+
+      List<Map<String, dynamic>> classesWithAttendance = [];
+      
+      for (final schedule in schedules) {
+        final hasAttendance = await _hasAttendanceForToday(schedule['id'] as int);
+        
+        classesWithAttendance.add({
+          'courseId': schedule['courseId'],
+          'courseName': schedule['courseName'],
+          'startTime': schedule['startTime'],
+          'endTime': schedule['endTime'],
+          'room': schedule['room'],
+          'hasAttendance': hasAttendance,
+          'scheduleId': schedule['id'],
+        });
+      }
+      
+      if (mounted) {
+        setState(() {
+          _todaysClasses = classesWithAttendance;
+        });
+      }
+    } catch (e) {
+      print('Error loading today\'s classes: $e');
+      if (mounted) {
+        setState(() {
+          _todaysClasses = [];
+        });
+      }
+    }
+  }
+
+  String _getDayName(int weekday) {
+    switch (weekday) {
+      case 1: return 'Monday';
+      case 2: return 'Tuesday';
+      case 3: return 'Wednesday';
+      case 4: return 'Thursday';
+      case 5: return 'Friday';
+      case 6: return 'Saturday';
+      case 7: return 'Sunday';
+      default: return '';
+    }
+  }
+
+  Future<bool> _hasAttendanceForToday(int scheduleId) async {
+    try {
+      final today = DateTime.now();
+      final dateString = '${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}';
+      
+      final status = await DatabaseService.instance.getClassAttendanceStatus(
+        scheduleId: scheduleId,
+        date: dateString,
+      );
+      
+      return status != null;
+    } catch (e) {
+      print('Error checking attendance for today: $e');
+      return false;
+    }
+  }
+
+  Widget _buildTodaysClassesPanel() {
+    final today = DateTime.now();
+    final formattedDate = '${_getDayName(today.weekday)}, ${today.day}/${today.month}/${today.year}';
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  Icons.today,
+                  color: Theme.of(context).colorScheme.primary,
+                  size: 20,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'Today\'s Classes',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: Theme.of(context).colorScheme.primary,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              formattedDate,
+              style: TextStyle(
+                fontSize: 14,
+                color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+              ),
+            ),
+            const SizedBox(height: 16),
+            
+            if (_todaysClasses.isEmpty)
+              Container(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  children: [
+                    Icon(
+                      Icons.free_breakfast,
+                      size: 48,
+                      color: Theme.of(context).colorScheme.onSurface.withOpacity(0.5),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'No classes today! Enjoy your free time.',
+                      style: TextStyle(
+                        fontSize: 16,
+                        color: Theme.of(context).colorScheme.onSurface.withOpacity(0.7),
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              )
+            else
+              ...(_todaysClasses.map((classInfo) => _buildClassAttendanceCard(classInfo)).toList()),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildClassAttendanceCard(Map<String, dynamic> classInfo) {
+    final hasAttendance = classInfo['hasAttendance'] as bool;
+    
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: hasAttendance 
+          ? Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.3)
+          : Theme.of(context).colorScheme.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: hasAttendance
+            ? Theme.of(context).colorScheme.outline.withOpacity(0.3)
+            : Theme.of(context).colorScheme.outline.withOpacity(0.5),
+        ),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        classInfo['courseName'],
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: hasAttendance 
+                            ? Theme.of(context).colorScheme.onSurface.withOpacity(0.7)
+                            : Theme.of(context).colorScheme.onSurface,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          Icon(
+                            Icons.schedule,
+                            size: 16,
+                            color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            classInfo['startTime'] ?? 'No time set',
+                            style: TextStyle(
+                              fontSize: 14,
+                              color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
+                            ),
+                          ),
+                          if (classInfo['room'] != null && classInfo['room'].toString().isNotEmpty) ...[
+                            const SizedBox(width: 12),
+                            Icon(
+                              Icons.room,
+                              size: 16,
+                              color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              classInfo['room'],
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: Theme.of(context).colorScheme.onSurface.withOpacity(0.6),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+                if (hasAttendance)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.primary.withOpacity(0.1),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      'Recorded',
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            
+            if (!hasAttendance) ...[
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () => _markClassAttendance(classInfo, 'attended'),
+                      icon: const Icon(Icons.check, size: 18),
+                      label: const Text('Attended'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () => _markClassAttendance(classInfo, 'skipped'),
+                      icon: const Icon(Icons.close, size: 18),
+                      label: const Text('Skipped'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.orange,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: () => _markClassAttendance(classInfo, 'cancelled'),
+                      icon: const Icon(Icons.cancel, size: 18),
+                      label: const Text('Cancelled'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.grey,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _markClassAttendance(Map<String, dynamic> classInfo, String status) async {
+    try {
+      final today = DateTime.now();
+      final dateString = '${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}';
+      
+      final success = await DatabaseService.instance.markClassAttendance(
+        scheduleId: classInfo['scheduleId'],
+        date: dateString,
+        status: status,
+      );
+      
+      if (success) {
+        // If this was an attendance or skip (not cancelled), also update the old attendance system
+        if (status == 'attended' || status == 'skipped') {
+          await DatabaseService.instance.addAttendanceRecord(
+            classInfo['courseId'], 
+            today, 
+            isPresent: status == 'attended'
+          );
+        }
+        
+        // Refresh today's classes to update UI
+        await _loadTodaysClasses();
+        
+        // Show confirmation
+        if (mounted) {
+          String message;
+          Color color;
+          switch (status) {
+            case 'attended':
+              message = 'Marked as attended!';
+              color = Colors.green;
+              break;
+            case 'skipped':
+              message = 'Marked as skipped';
+              color = Colors.orange;
+              break;
+            case 'cancelled':
+              message = 'Marked as cancelled';
+              color = Colors.grey;
+              break;
+            default:
+              message = 'Attendance recorded';
+              color = Colors.blue;
+          }
+          
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(message),
+              backgroundColor: color,
+            ),
+          );
+        }
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Failed to record attendance'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      print('Error marking attendance: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Error recording attendance'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  void _editSemester(Map<String, dynamic> semester) async {
+    final result = await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => SetupSemesterPage(existingSemester: semester),
+      ),
+    );
+    
+    // Refresh dashboard if semester was updated
+    if (result == true) {
+      _refreshDashboardData();
+    }
+  }
+
+  void _showFullScreenMenu(BuildContext context) async {
+    await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (context) => const _FullScreenMenu(),
         fullscreenDialog: true,
       ),
     );
+    // Refresh dashboard data when returning from menu
+    // (in case any navigation from menu affected data)
+    _refreshDashboardData();
   }
 }
 
@@ -657,11 +1098,12 @@ class _FullScreenMenu extends StatelessWidget {
                       icon: Icons.person_outline,
                       title: 'Profile',
                       subtitle: 'View and edit your profile information',
-                      onTap: () {
+                      onTap: () async {
                         Navigator.of(context).pop();
-                        Navigator.of(context).push(
+                        await Navigator.of(context).push(
                           MaterialPageRoute(builder: (context) => const ProfilePage()),
                         );
+                        // Note: Profile changes don't typically affect semester data
                       },
                     ),
 

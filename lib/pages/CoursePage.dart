@@ -29,6 +29,7 @@ class _CoursePageState extends State<CoursePage> {
   Future<void> _loadCourseData() async {
     try {
       final data = await DatabaseService.instance.getCourseDetails(widget.courseId);
+      
       if (mounted) {
         setState(() {
           _courseData = data;
@@ -36,6 +37,7 @@ class _CoursePageState extends State<CoursePage> {
         });
       }
     } catch (e) {
+      print('Error loading course data: $e');
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -566,9 +568,10 @@ class _CoursePageState extends State<CoursePage> {
     // Convert schedule to a set of days that have classes (using 0=Sunday format)
     final classDays = <int>{};
     for (var s in schedule) {
-      // Convert from Monday=0 format to Sunday=0 format
-      int dayOfWeek = s['dayOfWeek'] as int;
-      int sundayBasedDay = (dayOfWeek + 1) % 7;
+      // Convert day name string to integer (Monday=1, Sunday=7) then to Sunday=0 format
+      String dayOfWeekString = s['dayOfWeek'] as String;
+      int dayOfWeek = _convertDayNameToNumber(dayOfWeekString);
+      int sundayBasedDay = dayOfWeek % 7; // Convert Monday=1 to Sunday=0 format
       classDays.add(sundayBasedDay);
     }
 
@@ -637,7 +640,7 @@ class _CoursePageState extends State<CoursePage> {
                   ),
                   child: Center(
                     child: Text(
-                      _getFullDayName(s['dayOfWeek'] as int).substring(0, 3),
+                      _getDayNameFromData(s['dayOfWeek']).substring(0, 3),
                       style: TextStyle(
                         fontSize: 10,
                         fontWeight: FontWeight.bold,
@@ -648,7 +651,7 @@ class _CoursePageState extends State<CoursePage> {
                 ),
                 const SizedBox(width: 8),
                 Text(
-                  '${s['startTime']} - ${s['endTime']}',
+                  '${s['startTime'] ?? 'No start time'} - ${s['endTime'] ?? 'No end time'}',
                   style: TextStyle(
                     fontSize: 14,
                     fontWeight: FontWeight.w500,
@@ -692,6 +695,28 @@ class _CoursePageState extends State<CoursePage> {
         onScheduleUpdated: _loadCourseData,
       ),
     );
+  }
+
+  String _getDayNameFromData(dynamic dayOfWeek) {
+    if (dayOfWeek is String) {
+      return dayOfWeek; // Already a day name
+    } else if (dayOfWeek is int) {
+      return _getFullDayName(dayOfWeek); // Convert from integer
+    }
+    return 'Monday'; // Default fallback
+  }
+
+  int _convertDayNameToNumber(String dayName) {
+    const dayMap = {
+      'Monday': 1,
+      'Tuesday': 2,
+      'Wednesday': 3,
+      'Thursday': 4,
+      'Friday': 5,
+      'Saturday': 6,
+      'Sunday': 7,
+    };
+    return dayMap[dayName] ?? 1; // Default to Monday if not found
   }
 }
 
@@ -875,7 +900,7 @@ class _ScheduleModalState extends State<_ScheduleModal> {
                                   ),
                                   child: Center(
                                     child: Text(
-                                      _getFullDayName(schedule['dayOfWeek'] as int).substring(0, 3),
+                                      _getDayNameFromData(schedule['dayOfWeek']).substring(0, 3),
                                       style: TextStyle(
                                         fontSize: 10,
                                         fontWeight: FontWeight.bold,
@@ -890,7 +915,9 @@ class _ScheduleModalState extends State<_ScheduleModal> {
                                     crossAxisAlignment: CrossAxisAlignment.start,
                                     children: [
                                       Text(
-                                        '${schedule['startTime']} - ${schedule['endTime']}',
+                                        schedule['startTime'] != null && schedule['endTime'] != null
+                                            ? '${schedule['startTime']} - ${schedule['endTime']}'
+                                            : 'No time set',
                                         style: const TextStyle(
                                           fontSize: 16,
                                           fontWeight: FontWeight.w600,
@@ -992,11 +1019,6 @@ class _ScheduleModalState extends State<_ScheduleModal> {
     );
   }
 
-  String _getFullDayName(int dayOfWeek) {
-    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-    return days[dayOfWeek % 7];
-  }
-
   void _addScheduleEntry() {
     _showScheduleEntryDialog();
   }
@@ -1034,13 +1056,25 @@ class _ScheduleModalState extends State<_ScheduleModal> {
     final isEditing = editingIndex != null;
     final existingEntry = isEditing ? _scheduleEntries[editingIndex] : null;
 
-    int selectedDay = existingEntry?['dayOfWeek'] ?? 0; // Monday = 0
-    TimeOfDay startTime = existingEntry != null 
+    // Handle both string and integer dayOfWeek values
+    int selectedDay = 0; // Default to Monday
+    if (existingEntry != null && existingEntry['dayOfWeek'] != null) {
+      final dayOfWeek = existingEntry['dayOfWeek'];
+      if (dayOfWeek is int) {
+        selectedDay = dayOfWeek;
+      } else if (dayOfWeek is String) {
+        selectedDay = _convertDayNameToNumber(dayOfWeek) - 1; // Convert to 0-based index
+      }
+    }
+    
+    TimeOfDay startTime = existingEntry != null && existingEntry['startTime'] != null
         ? _parseTimeOfDay(existingEntry['startTime'])
+        : existingEntry != null && existingEntry['time'] != null
+        ? _parseTimeOfDay(existingEntry['time'])  // Fallback to old 'time' field
         : const TimeOfDay(hour: 9, minute: 0);
-    TimeOfDay endTime = existingEntry != null 
+    TimeOfDay endTime = existingEntry != null && existingEntry['endTime'] != null
         ? _parseTimeOfDay(existingEntry['endTime'])
-        : const TimeOfDay(hour: 10, minute: 30);
+        : TimeOfDay(hour: startTime.hour + 1, minute: startTime.minute); // Default to 1 hour after start
     String room = existingEntry?['room'] ?? '';
 
     final roomController = TextEditingController(text: room);
@@ -1164,10 +1198,14 @@ class _ScheduleModalState extends State<_ScheduleModal> {
                   return;
                 }
 
+                // Convert selectedDay to day name string
+                const dayNames = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+                final dayOfWeekString = dayNames[selectedDay % 7];
+
                 final entry = {
                   'id': existingEntry?['id'],
                   'courseId': widget.courseId,
-                  'dayOfWeek': selectedDay,
+                  'dayOfWeek': dayOfWeekString,
                   'startTime': _formatTimeOfDay(startTime),
                   'endTime': _formatTimeOfDay(endTime),
                   'room': roomController.text.trim().isEmpty ? null : roomController.text.trim(),
@@ -1250,5 +1288,29 @@ class _ScheduleModalState extends State<_ScheduleModal> {
         });
       }
     }
+  }
+
+  String _getDayNameFromData(dynamic dayOfWeek) {
+    if (dayOfWeek is String) {
+      return dayOfWeek; // Already a day name
+    } else if (dayOfWeek is int) {
+      // Convert from integer (0=Monday format) to day name
+      const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+      return days[dayOfWeek % 7];
+    }
+    return 'Monday'; // Default fallback
+  }
+
+  int _convertDayNameToNumber(String dayName) {
+    const dayMap = {
+      'Monday': 1,
+      'Tuesday': 2,
+      'Wednesday': 3,
+      'Thursday': 4,
+      'Friday': 5,
+      'Saturday': 6,
+      'Sunday': 7,
+    };
+    return dayMap[dayName] ?? 1; // Default to Monday if not found
   }
 }

@@ -7,6 +7,7 @@ import 'services/database_service.dart';
 import 'pages/dashboard.dart';
 import 'providers/theme_provider.dart';
 
+
 void main() {
   runApp(
     ChangeNotifierProvider(
